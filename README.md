@@ -1,2 +1,3 @@
-# Synthetic Self Supervised Learning Tasks
-Tasks for investigating self-supervised learning.
+# Synthetic Self Supervised Learning
+
+TODO

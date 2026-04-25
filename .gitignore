@@ -1,0 +1,8 @@
+.venv
+.pytest_cache
+src/ambientcg/*.png
+src/ambientcg/*.jpg
+data/
+*.svg
+__pycache__/
+uv.lock

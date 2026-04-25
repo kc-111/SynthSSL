@@ -1,0 +1,56 @@
+[project]
+name = "synthssl"
+version = "0.1.0"
+description = "Synthetic dataset generator for stress-testing self-supervised learning methods."
+readme = "README.md"
+requires-python = ">=3.12.6"
+dependencies = [
+    # Phase 1 runtime
+    "numpy>=2.4.4",
+    "pillow>=10.4",
+    "pyyaml>=6.0",
+    "pandas>=2.2",
+    "pyarrow>=17.0",
+    "jsonschema>=4.23",
+    "pycairo>=1.29.0",
+    # Phase 3 visualization
+    "matplotlib>=3.9",
+    "jinja2>=3.1",
+    # Added in later phases; declared here so lockfile stays stable once rendering lands:
+    #   opencv-python, imageio (Phase 2/6 — video I/O)
+    #   safetensors (Phase 7 — storage backend)
+    "safetensors>=0.7.0",
+    "seaborn>=0.13.2",
+    "requests>=2.33.1",
+    "cairosvg>=2.9.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+]
+
+[project.optional-dependencies]
+# Install with: uv sync --extra experiments
+# Pulls stable-pretraining (SSL framework) + torch + eval dependencies.
+experiments = [
+    "stable-pretraining",
+    "torch",
+    "torchvision",
+    "lightning",
+    "scikit-learn",
+]
+
+[tool.uv.sources]
+stable-pretraining = { path = "../stable-pretraining", editable = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/SynthSSL"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
