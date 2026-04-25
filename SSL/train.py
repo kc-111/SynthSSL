@@ -65,7 +65,7 @@ PRETRAIN_DIRS = {
 IMAGE_SIZE = 128
 EMB_DIM = 512
 
-DEFAULT_PROBE_TASKS = ["group", "subgroup", "base_leaf"]
+DEFAULT_PROBE_TASKS = ["group", "subgroup"]#, "base_leaf"]
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +142,7 @@ def _make_train_tf():
     one = transforms.Compose(
         transforms.RGB(),
         # transforms.RandomResizedCrop((IMAGE_SIZE, IMAGE_SIZE), scale=(0.08, 1.0)),
-        transforms.RandomResizedCrop((IMAGE_SIZE, IMAGE_SIZE), scale=(0.8, 1.0)),
+        transforms.RandomResizedCrop((IMAGE_SIZE, IMAGE_SIZE), scale=(0.75, 1.0)),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.ColorJitter(brightness=0.4, contrast=0.4,
                                 saturation=0.2, hue=0.1, p=0.8),
@@ -309,16 +309,16 @@ def _probe_sources(choice: str, proj_dim: int) -> list[tuple[str, str, int]]:
 def build_parser():
     p = argparse.ArgumentParser()
     p.add_argument("--recipe", default="small", choices=["small", "large"])
-    p.add_argument("--regularizer", default="sigreg",
+    p.add_argument("--regularizer", default="w1",
                    choices=["sigreg", "w1", "w2"])
-    p.add_argument("--lambd", type=float, default=0.05)
+    p.add_argument("--lambd", type=float, default=0.95)
     p.add_argument("--inv-tol", type=float, default=0.0,
                    help="Invariance margin ε ∈ [0, 1]. Fraction of the "
                         "N(0, I) prior floor ‖z_i − z̄‖² = D·(V−1)/V below "
                         "which invariance has no penalty. 0 = strict "
                         "invariance (default); 1 = no pressure below "
                         "the regularizer equilibrium.")
-    p.add_argument("--proj-dim", type=int, default=2048)
+    p.add_argument("--proj-dim", type=int, default=64)
     p.add_argument("--proj-hidden", type=int, default=2048)
     p.add_argument("--num-proj", type=int, default=1024)
     p.add_argument("--knots", type=int, default=17)

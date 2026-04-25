@@ -231,7 +231,10 @@ class OnlineProbe(pl.Callback):
         if lines:
             # Pull the SSL loss components (logged from train.py's forward
             # via ``self.log("fit/{loss,reg,inv}", ...)``). Lightning adds
-            # an "_epoch" suffix to per-epoch-reduced values.
+            # an "_epoch" suffix to per-epoch-reduced values. Also surface
+            # any ``*_active`` diagnostics (e.g. ``inv_view_active`` from
+            # train_equiv.py — fraction of samples whose margin clamp
+            # actually triggered).
             metrics = trainer.callback_metrics
             ssl_bits = []
             for name in ("loss", "reg", "inv"):
@@ -239,6 +242,20 @@ class OnlineProbe(pl.Callback):
                     if key in metrics:
                         ssl_bits.append(f"{name}={float(metrics[key]):.4f}")
                         break
+            # Lightning logs both ``fit/x`` (last step) and ``fit/x_epoch``
+            # (epoch mean) — prefer the epoch one, fall back to the step
+            # one, deduped by short name.
+            seen: set[str] = set()
+            for key in sorted(metrics, key=lambda k: not k.endswith("_epoch")):
+                if not key.startswith("fit/"):
+                    continue
+                short = key[len("fit/"):]
+                if short.endswith("_epoch"):
+                    short = short[:-len("_epoch")]
+                if not short.endswith("_active") or short in seen:
+                    continue
+                seen.add(short)
+                ssl_bits.append(f"{short}={float(metrics[key]):.3f}")
 
             header = f"[probe] epoch {trainer.current_epoch}"
             if ssl_bits:
