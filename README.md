@@ -7,6 +7,7 @@ Current Findings (based on online linear probing):
 2. There is a gap between backbone and projector performance (see guillotine regularization).
 3. Instead of only invariance, f(g(z_1, t), z_2) where f is the objective, g is the transformation predictor, t is the transformation parameters, and z are the latent representations does work to some degree. Technically, the ideal case is probably some version of "Self-supervised Transformation Learning for Equivariant Representations" where they used a projector for invariance, one for equivariance, and one for transformation. In my opinion, I don't believe in the transformation projector (paper ablation studies show so too), and the paper showed that the equivariance one is best (the method implemented here is different though).
     - I wonder if we apply augmentations to a specific location on the image, will it be able to train just based on that.
+4. Adding a blurry reconstruction objective does not create a noticeably better latents for linear probing.
 
 ![Scenes](demo_scenes.png)
 

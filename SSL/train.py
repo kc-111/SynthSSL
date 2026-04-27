@@ -60,6 +60,7 @@ PROBE_ROOT = DATASET_ROOT / "probe"
 PRETRAIN_DIRS = {
     "small": DATASET_ROOT / "pretrain_small",
     "large": DATASET_ROOT / "pretrain_large",
+    "xlarge": DATASET_ROOT / "pretrain_xlarge",
 }
 
 IMAGE_SIZE = 128
@@ -308,7 +309,7 @@ def _probe_sources(choice: str, proj_dim: int) -> list[tuple[str, str, int]]:
 
 def build_parser():
     p = argparse.ArgumentParser()
-    p.add_argument("--recipe", default="small", choices=["small", "large"])
+    p.add_argument("--recipe", default="large", choices=["small", "large"])
     p.add_argument("--regularizer", default="w1",
                    choices=["sigreg", "w1", "w2"])
     p.add_argument("--lambd", type=float, default=0.95)

@@ -237,7 +237,7 @@ class OnlineProbe(pl.Callback):
             # actually triggered).
             metrics = trainer.callback_metrics
             ssl_bits = []
-            for name in ("loss", "reg", "inv"):
+            for name in ("loss", "reg", "inv", "recon"):
                 for key in (f"fit/{name}_epoch", f"fit/{name}"):
                     if key in metrics:
                         ssl_bits.append(f"{name}={float(metrics[key]):.4f}")

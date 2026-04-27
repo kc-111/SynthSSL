@@ -6,18 +6,17 @@ record the **full augmentation chain** that produced each — every
 random decision lands in a per-view action vector::
 
     t_i = (
-        crop_cx, crop_cy, crop_w, crop_h,         #  4: random resized crop
-        flip,                                     #  1: horizontal flip
+        crop_cx, crop_cy, crop_w, crop_h,         # 4: random resized crop
+        flip,                                     # 1: horizontal flip
         color_applied, brightness, contrast,
-        saturation, hue,                          #  5: color jitter
-        gray_applied,                             #  1: random grayscale
-        blur_applied, blur_sigma,                 #  2: gaussian blur
-        solarize_applied,                         #  1: solarize
-        K × (applied, cx, cy, w, h),              # 5K: hard random-erase
+        saturation, hue,                          # 5: color jitter
+        gray_applied,                             # 1: random grayscale
+        blur_applied, blur_sigma, blur_iters,     # 3: gaussian blur (iter)
+        solarize_applied,                         # 1: solarize
     )
 
-(14 + 5·K numbers per view; with K=4 → 34/view → 68 concatenated as
-``t = [t_v1, t_v2]``). The predictor is a small MLP::
+(15 numbers per view → 30 concatenated as ``t = [t_v1, t_v2]``). The
+predictor is a small MLP::
 
     g : (z_1, t)  ↦  ẑ_2
 
@@ -67,13 +66,13 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import random
 from pathlib import Path
 
 import lightning as pl
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 from lightning.pytorch.callbacks import ModelCheckpoint
@@ -98,6 +97,7 @@ PROBE_ROOT = DATASET_ROOT / "probe"
 PRETRAIN_DIRS = {
     "small": DATASET_ROOT / "pretrain_small",
     "large": DATASET_ROOT / "pretrain_large",
+    "xlarge": DATASET_ROOT / "pretrain_xlarge",
 }
 
 IMAGE_SIZE = 128
@@ -121,17 +121,14 @@ EMB_DIM = 512
 #   9    hue               [-1, 1]        0   (factor 0.0 → 0)
 #   10   gray_applied      {0, 1}         0
 #   11   blur_applied      {0, 1}         0
-#   12   blur_sigma        [0, 1]         0   (sigma 0 → 0)
-#   13   solarize_applied  {0, 1}         0
-#   14..18   mask_0: (applied, cx, cy, w, h)  {0,1} / [0,1]
-#   19..23   mask_1: ...
-#   24..28   mask_2: ...
-#   29..33   mask_3: ...
-#
-# Mask slots are FIXED LENGTH so the action vector size is constant. An
-# unused slot is all zeros; an active slot carries its bbox like the
-# crop bbox does. Slots are independent — no canonical ordering is
-# imposed, the predictor handles the small permutation-invariance burden.
+#   12   blur_sigma        [0, 1]         0   (BLUR_SIGMA_RANGE → [0, 1];
+#                                              gate idx 11 distinguishes
+#                                              "not applied" from "applied
+#                                              at min")
+#   13   blur_iters        [0, 1]         0   (BLUR_ITER_RANGE → [0, 1])
+#   14   solarize_applied  {0, 1}         0
+T_DIM_PER_VIEW = 15
+T_DIM = 2 * T_DIM_PER_VIEW
 
 # ColorJitter ranges (must match the original train.py recipe).
 BRIGHTNESS_RANGE = 0.4
@@ -142,21 +139,37 @@ COLOR_APPLY_P = 0.8
 GRAY_APPLY_P = 0.2
 BLUR_APPLY_P = 0.5
 BLUR_SIGMA_RANGE = (0.1, 2.0)
+# Augmentation blur is applied *iteratively* with a small kernel. When
+# gated on, sample N from this inclusive range and apply the same
+# gaussian N times — heavy diffusion that smooths high-frequency content
+# while keeping the object recognizable, with proper compact-support
+# boundary handling per pass.
+BLUR_ITER_RANGE = (5, 30)
+# Aug blur sigma is discretized into N bins (linspace across BLUR_SIGMA_RANGE)
+# so we can cache a (n_bins, n_max) table of equivalent gaussian kernels.
+# Setting this >= 4 covers the practical range without losing much
+# variation; 8 is a sensible default.
+N_AUG_SIGMA_BINS = 8
 SOLARIZE_APPLY_P = 0.2
 SOLARIZE_THRESHOLD = 128   # uint8 PIL — applied before ToTensor
 
-# Hard random-erase masking. Several small patches per view rather than
-# one large one — the predictor should anticipate localized info loss in
-# z_2, but a single big mask wipes too much for a small encoder to recover.
-MASK_K = 4                      # max masks per view (fixed action-vector length)
-MASK_APPLY_P = 0.5              # per-slot independent apply prob (E[N] = K·p)
-MASK_SCALE = (0.02, 0.10)       # area fraction per mask — capped small
-MASK_RATIO = (0.5, 2.0)         # aspect bounds (less extreme than torchvision)
-T_DIM_PER_VIEW = 14 + 5 * MASK_K
-T_DIM = 2 * T_DIM_PER_VIEW
-
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
+
+# Per-view recon target: low-radius gaussian blur (anti-aliasing pre-filter)
+# then bilinear downscale of the (already normalized) augmented view.
+# Decoder is a small transposed-conv CNN on top of the backbone embedding.
+RECON_SIZE = 64
+RECON_BASE_CH = 128         # channels at the 4×4 stage of the decoder
+RECON_BLUR_SIGMA = 1.0      # low-pass before downscale to kill aliasing
+RECON_BLUR_KERNEL = 23
+# Per-view, per-step we sample N uniformly in this inclusive range and
+# iterate the small (kernel=3) gaussian N times to build the recon
+# target. The decoder is conditioned on N (normalized), so the encoder
+# must retain enough multi-frequency content to be queryable across the
+# whole range. Wide range (50–400) ensures all high-frequency content is
+# smoothed out while objects remain distinguishable at the low end.
+RECON_BLUR_ITER_RANGE = (5, 15)
 
 DEFAULT_PROBE_TASKS = ["group"]#, "subgroup"]#, "base_leaf"]
 
@@ -247,26 +260,32 @@ class EquivariantPairDataset(Dataset):
     """
 
     def __init__(self, base: Dataset, image_size: int,
-                 scale: tuple[float, float] = (0.5, 1.0),
+                 scale: tuple[float, float] = (0.8, 1.0),
                  ratio: tuple[float, float] = (3/4, 4/3),
-                 photo_aug: bool = True):
+                 photo_aug: bool = True,
+                 recon: bool = False):
         self.base = base
         self.image_size = image_size
         self.scale = scale
         self.ratio = ratio
         self.photo_aug = photo_aug
+        self.recon = recon
 
     def __len__(self):
         return len(self.base)
 
-    def _view(self, img: Image.Image) -> tuple[torch.Tensor, torch.Tensor]:
+    def _view(self, img: Image.Image
+              ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sample one full augmentation chain on ``img`` and return
-        ``(tensor view, T_DIM_PER_VIEW action vector)``.
+        ``(tensor view, action vector, aug-blur metadata)``.
 
         The action records *every* random decision so the predictor can
         see exactly what produced its target view. Non-applied gated ops
         leave their continuous fields at the identity value (= 0 after
-        normalization).
+        normalization). Aug-blur is *recorded* here but not applied —
+        the actual gaussian conv runs on the GPU in forward() against a
+        cached kernel table indexed by ``(sigma_bin, n_iter)``. The 3-
+        element long tensor returned is ``(applied, sigma_bin, n_iter)``.
         """
         W, H = img.size
 
@@ -285,7 +304,12 @@ class EquivariantPairDataset(Dataset):
         b_factor, c_factor, s_factor, h_factor = 1.0, 1.0, 1.0, 0.0
         gray_applied = 0
         blur_applied = 0
-        sigma = 0.0
+        # Normalized blur params live in [0, 1] over the *applied range*.
+        # When not applied, both stay at 0 (gate at idx 11 disambiguates).
+        sigma_norm = 0.0
+        iters_norm = 0.0
+        sigma_bin = 0
+        blur_iters = 0
         solar_applied = 0
 
         if self.photo_aug:
@@ -313,16 +337,26 @@ class EquivariantPairDataset(Dataset):
                 gray_applied = 1
                 v = TF.rgb_to_grayscale(v, num_output_channels=3)
 
-            # 4. Gaussian blur: gated by BLUR_APPLY_P; sigma sampled
-            #    uniformly in BLUR_SIGMA_RANGE when on.
+            # 4. Gaussian blur: gated by BLUR_APPLY_P. Sigma is
+            #    discretized into N_AUG_SIGMA_BINS bins; iter count is
+            #    sampled in BLUR_ITER_RANGE. Both are *recorded only* —
+            #    the actual conv happens on the GPU against a cached
+            #    kernel table (closed-form σ_eff = σ_bin · √N), which
+            #    avoids tens of ms of CPU work per view.
             if random.random() < BLUR_APPLY_P:
                 blur_applied = 1
-                sigma = random.uniform(*BLUR_SIGMA_RANGE)
-                v = TF.gaussian_blur(v, kernel_size=23,
-                                     sigma=[sigma, sigma])
+                sigma_bin = random.randint(0, N_AUG_SIGMA_BINS - 1)
+                blur_iters = random.randint(*BLUR_ITER_RANGE)
+                if N_AUG_SIGMA_BINS > 1:
+                    sigma_norm = sigma_bin / (N_AUG_SIGMA_BINS - 1)
+                n_lo, n_hi = BLUR_ITER_RANGE
+                iters_norm = ((blur_iters - n_lo)
+                              / max(n_hi - n_lo, 1))
 
-            # 5. Solarize: gated by SOLARIZE_APPLY_P (operates on uint8
-            #    PIL — keep it before ToTensor below).
+            # 5. Solarize: gated by SOLARIZE_APPLY_P. Operates on uint8
+            #    PIL — applied before ToTensor below. Note: with aug
+            #    blur deferred to the GPU, solarize now sees the
+            #    *unblurred* image (used to be the other way around).
             if random.random() < SOLARIZE_APPLY_P:
                 solar_applied = 1
                 v = TF.solarize(v, threshold=SOLARIZE_THRESHOLD)
@@ -330,39 +364,6 @@ class EquivariantPairDataset(Dataset):
         # 6. ToTensor + ImageNet normalize.
         v = TF.to_tensor(v)
         v = TF.normalize(v, mean=IMAGENET_MEAN, std=IMAGENET_STD)
-
-        # 7. Hard random-erase masking. K independent slots per view; each
-        #    decides independently whether to mask (Bernoulli MASK_APPLY_P).
-        #    Applied AFTER normalize: filling with 0 = roughly the
-        #    ImageNet channel mean. Mask boxes are sampled by area
-        #    fraction × aspect ratio (log-uniform) and recorded into the
-        #    action vector so the predictor can anticipate the localized
-        #    info loss in this view.
-        H_, W_ = self.image_size, self.image_size
-        mask_actions: list[float] = []
-        if self.photo_aug:
-            for _ in range(MASK_K):
-                if random.random() < MASK_APPLY_P:
-                    area_frac = random.uniform(*MASK_SCALE)
-                    log_lo, log_hi = math.log(MASK_RATIO[0]), math.log(MASK_RATIO[1])
-                    aspect = math.exp(random.uniform(log_lo, log_hi))   # h / w
-                    area_pixels = area_frac * H_ * W_
-                    h_mask = max(1, min(H_, int(round(math.sqrt(area_pixels * aspect)))))
-                    w_mask = max(1, min(W_, int(round(math.sqrt(area_pixels / aspect)))))
-                    i_m = random.randint(0, H_ - h_mask)
-                    j_m = random.randint(0, W_ - w_mask)
-                    v[:, i_m:i_m + h_mask, j_m:j_m + w_mask] = 0.0
-                    mask_actions.extend([
-                        1.0,
-                        (j_m + w_mask / 2) / W_,
-                        (i_m + h_mask / 2) / H_,
-                        w_mask / W_,
-                        h_mask / H_,
-                    ])
-                else:
-                    mask_actions.extend([0.0, 0.0, 0.0, 0.0, 0.0])
-        else:
-            mask_actions = [0.0] * (5 * MASK_K)
 
         # Action vector. See module-level layout doc for index meanings.
         # Normalize continuous params to roughly [-1, 1] (or [0, 1]) so
@@ -380,22 +381,159 @@ class EquivariantPairDataset(Dataset):
             h_factor / HUE_RANGE,
             float(gray_applied),
             float(blur_applied),
-            sigma / BLUR_SIGMA_RANGE[1],
+            sigma_norm,
+            iters_norm,
             float(solar_applied),
-            *mask_actions,
         ], dtype=torch.float32)
-        return v, t
+        aug_blur = torch.tensor(
+            [blur_applied, sigma_bin, blur_iters], dtype=torch.long)
+        return v, t, aug_blur
 
     def __getitem__(self, idx):
         sample = self.base[idx]
         img = sample.pop("_pil")
-        v1, t1 = self._view(img)
-        v2, t2 = self._view(img)
+        v1, t1, ab1 = self._view(img)
+        v2, t2, ab2 = self._view(img)
         sample["image_v1"] = v1
         sample["image_v2"] = v2
         sample["t_v1"] = t1
         sample["t_v2"] = t2
+        # (applied, sigma_bin, n_iter) per view — consumed in forward()
+        # to apply the cached aug blur on the GPU.
+        sample["aug_blur_v1"] = ab1
+        sample["aug_blur_v2"] = ab2
+        if self.recon:
+            # Per-view, per-step draw of blur iterations in
+            # RECON_BLUR_ITER_RANGE. The actual blur+downsample is done
+            # on the GPU in forward() (see _gpu_iter_blur_downsample) so
+            # the dataloader stays light; we just emit the integer N
+            # here. Forward also computes the [0, 1] conditioning value
+            # the decoder receives.
+            sample["recon_n_v1"] = torch.tensor(
+                random.randint(*RECON_BLUR_ITER_RANGE), dtype=torch.long)
+            sample["recon_n_v2"] = torch.tensor(
+                random.randint(*RECON_BLUR_ITER_RANGE), dtype=torch.long)
         return sample
+
+
+# ---------------------------------------------------------------------------
+# GPU recon-target generation: iterative diffusion + downsample
+# ---------------------------------------------------------------------------
+
+def _build_iter_blur_table_1d(n_max: int, sigma: float, *,
+                              device, dtype) -> torch.Tensor:
+    """Precompute the 1D gaussian equivalent to iterating a per-pass
+    ``sigma`` gaussian N times, for N = 1, ..., ``n_max``.
+
+    Iterating a well-resolved gaussian (one whose base kernel covers
+    ≥ ±3σ, so each pass is essentially the true Gaussian) is exactly a
+    convolution of Gaussians, so by additivity of variance the N-times-
+    iterated kernel is itself a Gaussian with ``σ_eff = σ·√N``. We
+    build that closed form directly: ~O(1) memory and runtime, no
+    recursion, kernel width stays tight (2·⌈3·σ·√n_max⌉ + 1).
+
+    Caveat vs. running the actual iterative loop: only the *boundary
+    band* differs (single reflect-pad instead of N reflect-pads).
+    Bulk pixels are identical.
+    """
+    sigma_max = sigma * (n_max ** 0.5)
+    K = 2 * int(round(3 * sigma_max)) + 1
+    if K % 2 == 0:
+        K += 1
+    coords = (torch.arange(K, dtype=dtype, device=device)
+              - (K // 2))
+
+    table = torch.zeros(n_max, K, dtype=dtype, device=device)
+    for n in range(1, n_max + 1):
+        sig = sigma * (n ** 0.5)
+        g = torch.exp(-(coords ** 2) / (2 * sig ** 2))
+        table[n - 1] = g / g.sum()
+    return table
+
+
+def _apply_cached_separable_blur(v: torch.Tensor,
+                                  k1d: torch.Tensor) -> torch.Tensor:
+    """Apply per-sample 1D gaussian as a separable batched depthwise
+    conv (H then V) using grouped conv2d. ``v`` is (B, C, H, W); ``k1d``
+    is (B, K). Reflection padding once on each axis."""
+    B, C, H, W = v.shape
+    K = k1d.shape[1]
+    pad = K // 2
+    kh = (k1d.view(B, 1, 1, K)
+              .expand(B, C, 1, K)
+              .reshape(B * C, 1, 1, K))
+    kv = (k1d.view(B, 1, K, 1)
+              .expand(B, C, K, 1)
+              .reshape(B * C, 1, K, 1))
+    x = v.reshape(1, B * C, H, W)
+    x = F.pad(x, [pad, pad, 0, 0], mode="reflect")
+    x = F.conv2d(x, kh, groups=B * C)
+    x = F.pad(x, [0, 0, pad, pad], mode="reflect")
+    x = F.conv2d(x, kv, groups=B * C)
+    return x.reshape(B, C, H, W)
+
+
+def _cached_separable_blur_downsample(v: torch.Tensor,
+                                       n_per_sample: torch.Tensor,
+                                       table: torch.Tensor,
+                                       out_size: int) -> torch.Tensor:
+    """Recon-target path: look up per-sample 1D kernel in ``table``
+    (indexed by N - 1, fixed sigma), apply separable blur, then bilinear
+    downsample to ``(out_size, out_size)``."""
+    k1d = table[n_per_sample - 1]
+    blurred = _apply_cached_separable_blur(v, k1d)
+    return F.interpolate(blurred, size=(out_size, out_size),
+                         mode="bilinear", align_corners=False,
+                         antialias=False)
+
+
+def _build_aug_blur_table_1d(n_max: int, n_bins: int,
+                             sigma_range: tuple[float, float], *,
+                             device, dtype) -> torch.Tensor:
+    """Precompute 1D gaussian kernels equivalent to N iterations of a
+    per-pass gaussian, indexed by ``(sigma_bin, N - 1)``.
+
+    ``sigma_bin`` runs over ``linspace(sigma_range, n_bins)``; for each
+    (bin, N) the cached row is a gaussian with σ_eff = bin_sigma · √N
+    (closed form of the iterative-diffusion result). All rows share a
+    single width K large enough for the maximum effective sigma.
+    """
+    sigma_lo, sigma_hi = sigma_range
+    sigma_values = torch.linspace(sigma_lo, sigma_hi, n_bins,
+                                   dtype=dtype, device=device)
+    sigma_eff_max = sigma_hi * (n_max ** 0.5)
+    K = 2 * int(round(3 * sigma_eff_max)) + 1
+    if K % 2 == 0:
+        K += 1
+    coords = (torch.arange(K, dtype=dtype, device=device)
+              - (K // 2))
+
+    table = torch.zeros(n_bins, n_max, K, dtype=dtype, device=device)
+    for s in range(n_bins):
+        sig = sigma_values[s].item()
+        for n in range(1, n_max + 1):
+            sig_eff = sig * (n ** 0.5)
+            g = torch.exp(-(coords ** 2) / (2 * sig_eff ** 2))
+            table[s, n - 1] = g / g.sum()
+    return table
+
+
+def _apply_aug_blur_gpu(v: torch.Tensor,
+                        applied: torch.Tensor,
+                        sigma_bin: torch.Tensor,
+                        n_iter: torch.Tensor,
+                        table: torch.Tensor) -> torch.Tensor:
+    """Apply the cached aug blur per-sample. Non-applied samples are
+    passed through unchanged via ``torch.where`` — we still pay the
+    grouped-conv cost on the whole batch (delta replacement would just
+    add another scatter), which is fine since one big batched conv is
+    much cheaper than the per-sample CPU loop it replaces.
+    """
+    B = v.shape[0]
+    safe_n = n_iter.clamp(min=1, max=table.shape[1])
+    k1d = table[sigma_bin, safe_n - 1]                 # (B, K)
+    blurred = _apply_cached_separable_blur(v, k1d)
+    return torch.where(applied.view(B, 1, 1, 1), blurred, v)
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +565,46 @@ def make_predictor(z_dim: int, t_dim: int, hidden: int) -> nn.Module:
     )
 
 
+def make_decoder(emb_dim: int, out_size: int, base_ch: int,
+                 cond_dim: int = 0) -> nn.Module:
+    """Decode backbone embedding → 3×out_size×out_size low-res view target.
+
+    Project the (concatenated) 1-D input ``[h ‖ cond]`` to a small
+    ``base_ch × 4 × 4`` spatial map, then double the spatial size with
+    stride-2 transposed convs until we hit ``out_size``, halving channel
+    width each step. A 1×1 conv head drops to RGB. ``cond_dim`` is the
+    width of any conditioning scalar/vector concatenated to the
+    embedding before the first linear (e.g. the normalized recon-blur
+    iter count) — set to 0 if unused.
+    """
+    init = 4
+    n_up = 0
+    spatial = init
+    while spatial < out_size:
+        spatial *= 2
+        n_up += 1
+    if spatial != out_size:
+        raise ValueError(
+            f"out_size={out_size} must be a power of 2 >= {init}")
+
+    layers: list[nn.Module] = [
+        nn.Linear(emb_dim + cond_dim, base_ch * init * init),
+        nn.Unflatten(1, (base_ch, init, init)),
+    ]
+    ch = base_ch
+    for _ in range(n_up):
+        next_ch = max(ch // 2, 16)
+        layers += [
+            nn.ConvTranspose2d(ch, next_ch, kernel_size=4,
+                               stride=2, padding=1),
+            nn.BatchNorm2d(next_ch),
+            nn.ReLU(inplace=True),
+        ]
+        ch = next_ch
+    layers.append(nn.Conv2d(ch, 3, kernel_size=1))
+    return nn.Sequential(*layers)
+
+
 # ---------------------------------------------------------------------------
 # Forward
 # ---------------------------------------------------------------------------
@@ -448,6 +626,26 @@ def make_forward(probe_tasks: list[str]):
         v1, v2 = batch["image_v1"], batch["image_v2"]
         t1, t2 = batch["t_v1"], batch["t_v2"]
         t_cat = torch.cat([t1, t2], dim=-1)              # (B, T_DIM)
+
+        # Apply aug blur on the GPU using a cached (sigma_bin, N) kernel
+        # table. The dataloader emits (applied, sigma_bin, n_iter) per
+        # view; ``_apply_aug_blur_gpu`` does one batched separable conv
+        # and passes non-applied samples through unchanged. Replaces a
+        # per-view CPU loop of ~5–15 gaussian_blur calls per __getitem__.
+        aug_table = getattr(self, "_aug_blur_table", None)
+        if aug_table is None or aug_table.device != v1.device:
+            aug_table = _build_aug_blur_table_1d(
+                BLUR_ITER_RANGE[1], N_AUG_SIGMA_BINS, BLUR_SIGMA_RANGE,
+                device=v1.device, dtype=torch.float32)
+            self._aug_blur_table = aug_table
+        atab = aug_table.to(dtype=v1.dtype)
+        ab1 = batch["aug_blur_v1"]                        # (B, 3) long
+        ab2 = batch["aug_blur_v2"]
+        with torch.no_grad():
+            v1 = _apply_aug_blur_gpu(
+                v1, ab1[:, 0].bool(), ab1[:, 1], ab1[:, 2], atab)
+            v2 = _apply_aug_blur_gpu(
+                v2, ab2[:, 0].bool(), ab2[:, 1], ab2[:, 2], atab)
 
         h1 = self.backbone(v1)
         h2 = self.backbone(v2)
@@ -491,6 +689,49 @@ def make_forward(probe_tasks: list[str]):
 
         loss = (self.lambd * reg
                 + (1.0 - self.lambd) * (inv_view + inv_pred))
+
+        # 3. Optional per-view reconstruction. Decode each view's backbone
+        #    embedding to a low-res copy of *that* view (not the original).
+        #    Targets are generated on the device with batched iterative
+        #    diffusion (lock-step gaussian conv) — this used to live in
+        #    the dataloader workers and was the main CPU bottleneck.
+        #    Decoder is conditioned on the per-view normalized iter count
+        #    so the encoder must retain enough multi-frequency content to
+        #    be queryable across the whole RECON_BLUR_ITER_RANGE.
+        if self.recon:
+            n1_int = batch["recon_n_v1"]                        # (B,) long
+            n2_int = batch["recon_n_v2"]
+            n_lo, n_hi = RECON_BLUR_ITER_RANGE
+            # Lazy-init the cached iterated-blur kernel table on the
+            # right device. Built once in fp32 (numerics matter for the
+            # autoconvolution recursion) and cast to the activation
+            # dtype on each use — cheap since the table is tiny.
+            cached = getattr(self, "_recon_blur_table", None)
+            if cached is None or cached.device != v1.device:
+                cached = _build_iter_blur_table_1d(
+                    n_hi, RECON_BLUR_SIGMA,
+                    device=v1.device, dtype=torch.float32)
+                self._recon_blur_table = cached
+            table = cached.to(dtype=v1.dtype)
+            with torch.no_grad():
+                target1 = _cached_separable_blur_downsample(
+                    v1, n1_int, table, RECON_SIZE)
+                target2 = _cached_separable_blur_downsample(
+                    v2, n2_int, table, RECON_SIZE)
+
+            denom = max(n_hi - n_lo, 1)
+            n1 = ((n1_int - n_lo).to(h1.dtype) / denom).unsqueeze(-1)
+            n2 = ((n2_int - n_lo).to(h2.dtype) / denom).unsqueeze(-1)
+            rec1 = self.decoder(torch.cat([h1, n1], dim=-1))
+            rec2 = self.decoder(torch.cat([h2, n2], dim=-1))
+            recon = 0.5 * (
+                (rec1 - target1).square().mean()
+                + (rec2 - target2).square().mean()
+            )
+            loss = loss + self.recon_weight * recon
+            self.log(f"{stage}/recon", recon,
+                     on_step=True, on_epoch=True, sync_dist=True)
+
         out["loss"] = loss
 
         # Features for online probes: concat both views' embeddings/projs +
@@ -559,12 +800,12 @@ def _probe_sources(choice: str, proj_dim: int) -> list[tuple[str, str, int]]:
 
 def build_parser():
     p = argparse.ArgumentParser()
-    p.add_argument("--recipe", default="small", choices=["small", "large"])
+    p.add_argument("--recipe", default="large", choices=["small", "large", "xlarge"])
     p.add_argument("--regularizer", default="w1",
                    choices=["sigreg", "w1", "w2"])
     p.add_argument("--lambd", type=float, default=0.95,
                    help="Weight on reg vs prediction loss.")
-    p.add_argument("--inv-tol", type=float, default=0.5,
+    p.add_argument("--inv-tol", type=float, default=0.05,
                    help="Margin on the VIEW-pair invariance loss as a "
                         "fraction of the N(0,I) prior floor D·(V−1)/V "
                         "(V=2 → D/2). Anchors z_1 and z_2 within a "
@@ -576,11 +817,17 @@ def build_parser():
     p.add_argument("--proj-hidden", type=int, default=2048)
     p.add_argument("--pred-hidden", type=int, default=2048,
                    help="Predictor MLP hidden width.")
+    p.add_argument("--recon", action="store_true",
+                   help="Enable per-view reconstruction: decode each "
+                        "backbone embedding to a 3×N×N bilinear-downscaled "
+                        f"copy of that view (N={RECON_SIZE}).")
+    p.add_argument("--recon-weight", type=float, default=0.01,
+                   help="Weight on the recon MSE loss when --recon is set.")
     p.add_argument("--num-proj", type=int, default=1024)
     p.add_argument("--knots", type=int, default=17)
-    p.add_argument("--batch-size", type=int, default=128)
+    p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--epochs", type=int, default=800)
-    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--weight-decay", type=float, default=5e-4)
     p.add_argument("--num-workers", type=int, default=16)
     p.add_argument("--seed", type=int, default=0)
@@ -593,7 +840,7 @@ def build_parser():
                    help="full: keep color jitter / grayscale / blur / "
                         "solarize on top of the geometric crop+flip. "
                         "none: only crop+flip (the actions encoded in t).")
-    p.add_argument("--scale-min", type=float, default=0.3)
+    p.add_argument("--scale-min", type=float, default=0.8)
     p.add_argument("--scale-max", type=float, default=1.0)
     return p
 
@@ -632,6 +879,7 @@ def main():
         concat, image_size=IMAGE_SIZE,
         scale=(args.scale_min, args.scale_max),
         photo_aug=args.photo_aug == "full",
+        recon=args.recon,
     )
     train_dl = DataLoader(
         train_ds,
@@ -654,7 +902,7 @@ def main():
     regularizer = make_regularizer(
         args.regularizer, num_proj=args.num_proj, knots=args.knots)
 
-    module = spt.Module(
+    module_kwargs = dict(
         backbone=backbone,
         projector=projector,
         predictor=predictor,
@@ -662,6 +910,8 @@ def main():
         regularizer=regularizer,
         lambd=args.lambd,
         inv_tol=args.inv_tol,
+        recon=args.recon,
+        recon_weight=args.recon_weight,
         optim={
             "optimizer": {
                 "type": "AdamW",
@@ -672,6 +922,11 @@ def main():
             "interval": "epoch",
         },
     )
+    if args.recon:
+        module_kwargs["decoder"] = make_decoder(
+            EMB_DIM, RECON_SIZE, RECON_BASE_CH, cond_dim=1)
+
+    module = spt.Module(**module_kwargs)
 
     sources = _probe_sources(args.probe, args.proj_dim)
     probe_cb = OnlineProbe(
