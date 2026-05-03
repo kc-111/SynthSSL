@@ -107,6 +107,11 @@ class SceneSpec:
             (a mix of ``STRUCTURED_BACKGROUNDS`` and ``"ambientcg"``).
         solid_color_bucket: If set, force the background to solid color
             from this COLOR_BUCKETS bucket. Implies ``base_source = "solid"``.
+        clean_background: If True, the background is a flat white canvas
+            with no procedural texture, no ambientCG sample, and no color
+            jitter — useful for "emoji-only" recipes that strip away
+            background variability. Highest precedence: overrides
+            ``solid_color_bucket`` and ``base_source_pool``.
         noise_enabled: False disables the noise overlay entirely.
         noise_type_forced: Force a specific noise type (from NOISE_TYPES).
         shadows: Whether per-object drop shadows are allowed.
@@ -119,6 +124,7 @@ class SceneSpec:
     emoji_pool: list[str] | None = None
     base_source_pool: list[str] | None = None
     solid_color_bucket: str | None = None
+    clean_background: bool = False
     noise_enabled: bool = True
     noise_type_forced: str | None = None
     shadows: bool = True
@@ -212,6 +218,17 @@ def bg_gabor(rng: random.Random) -> tuple[Image.Image, dict]:
                  "base_category": "gabor", "color_bucket": None}
 
 
+def bg_clean() -> tuple[Image.Image, dict]:
+    """Flat white canvas — no texture, no color, no provenance to record."""
+    img = Image.new("RGB", (CANVAS, CANVAS), (255, 255, 255))
+    return img, {
+        "base_source": "clean",
+        "base_id": None,
+        "base_category": "clean",
+        "color_bucket": None,
+    }
+
+
 def bg_ambientcg(rng: random.Random, category: str | None = None) -> tuple[Image.Image, dict]:
     """Random crop from an ambientCG texture, with full provenance.
 
@@ -238,10 +255,13 @@ _BG_DISPATCH = {
 def sample_background_for(rng: random.Random, spec: SceneSpec) -> tuple[Image.Image, dict]:
     """Sample a background according to the scene spec.
 
-    Solid-color-bucket constraint wins: if ``spec.solid_color_bucket`` is
-    set, always produces a solid of that bucket. Otherwise picks uniformly
-    from ``spec.base_source_pool`` (or all sources if unset).
+    Precedence: ``clean_background`` (flat white) > ``solid_color_bucket``
+    (solid in that bucket) > ``base_source_pool`` (uniform over the
+    listed sources) > the full source pool.
     """
+    if spec.clean_background:
+        return bg_clean()
+
     if spec.solid_color_bucket is not None:
         return bg_solid(rng, color_bucket=spec.solid_color_bucket)
 
@@ -536,10 +556,18 @@ def task_specs() -> dict[str, SceneSpec]:
     intersection = _intersection_pool()
     color_variant_pool = [h for hs in UNICODE_COLOR_VARIANTS.values() for h in hs]
 
+    clean_kw = dict(clean_background=True, noise_enabled=False, shadows=False)
+
     return {
         "pretrain":            SceneSpec(),  # full pipeline, no constraints
+        # Emoji-only recipe: one emoji on a flat white canvas, no noise,
+        # no shadows. ``n_objects=1`` matches the clean probe variants so
+        # pretrain and probe distributions are consistent.
+        "pretrain_clean":      SceneSpec(n_objects=1, **clean_kw),
         "group":               SceneSpec(n_objects=1),
         "subgroup":            SceneSpec(n_objects=1),
+        "group_clean":         SceneSpec(n_objects=1, **clean_kw),
+        "subgroup_clean":      SceneSpec(n_objects=1, **clean_kw),
         "base_leaf":           SceneSpec(n_objects=1),
         "style":               SceneSpec(n_objects=1, emoji_pool=intersection),
         "grid3x3":             SceneSpec(n_objects=1),

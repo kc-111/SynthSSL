@@ -152,6 +152,9 @@ def label_unicode_color(r: dict) -> str:
 LABEL_FUNCTIONS: dict[str, Callable[[dict], Any]] = {
     "group":            label_group,
     "subgroup":         label_subgroup,
+    # Emoji-only ("clean") variants — same labels, different scene spec.
+    "group_clean":      label_group,
+    "subgroup_clean":   label_subgroup,
     "leaf":             label_leaf,             # used against pretrain data
     "base_leaf":        label_base_leaf,
     "style":            label_style,

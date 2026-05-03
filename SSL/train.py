@@ -61,12 +61,19 @@ PRETRAIN_DIRS = {
     "small": DATASET_ROOT / "pretrain_small",
     "large": DATASET_ROOT / "pretrain_large",
     "xlarge": DATASET_ROOT / "pretrain_xlarge",
+    "clean": DATASET_ROOT / "pretrain_clean",
 }
 
 IMAGE_SIZE = 128
 EMB_DIM = 512
 
 DEFAULT_PROBE_TASKS = ["group", "subgroup"]#, "base_leaf"]
+# Recipe-specific defaults for ``--probe-tasks`` (used when the user
+# doesn't pass it). The ``clean`` recipe trains on emoji-only pretrain
+# images, so it should also probe against emoji-only labeled splits.
+RECIPE_DEFAULT_PROBE_TASKS = {
+    "clean": ["group_clean", "subgroup_clean"],
+}
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +316,8 @@ def _probe_sources(choice: str, proj_dim: int) -> list[tuple[str, str, int]]:
 
 def build_parser():
     p = argparse.ArgumentParser()
-    p.add_argument("--recipe", default="large", choices=["small", "large"])
+    p.add_argument("--recipe", default="clean",
+                   choices=["small", "large", "xlarge", "clean"])
     p.add_argument("--regularizer", default="w1",
                    choices=["sigreg", "w1", "w2"])
     p.add_argument("--lambd", type=float, default=0.95)
@@ -333,11 +341,14 @@ def build_parser():
     p.add_argument("--probe", default="both",
                    choices=["backbone", "projector", "both"],
                    help="Online probe feature source.")
-    p.add_argument("--probe-tasks", nargs="*", default=DEFAULT_PROBE_TASKS,
+    p.add_argument("--probe-tasks", nargs="*", default=None,
                    help="Tasks to probe online (emoji-identity classification "
                         "by default). Their train splits are mixed into the "
                         "training dataloader; probes train only on those "
-                        "samples. Full multi-task eval lives in eval.py.")
+                        "samples. Full multi-task eval lives in eval.py. "
+                        "Default depends on --recipe (clean → "
+                        "group_clean/subgroup_clean, otherwise "
+                        "group/subgroup).")
     p.add_argument("--eval-every", type=int, default=1,
                    help="Run probe TEST eval on probe/<task>/test/ every N "
                         "training epochs (0 = off). Logs "
@@ -348,6 +359,10 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
+
+    if args.probe_tasks is None:
+        args.probe_tasks = RECIPE_DEFAULT_PROBE_TASKS.get(
+            args.recipe, DEFAULT_PROBE_TASKS)
 
     log_dir = Path(__file__).resolve().parent / "logs"
     run_dir, run_name = allocate_run(log_dir, args.recipe, vars(args))

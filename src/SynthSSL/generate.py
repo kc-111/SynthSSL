@@ -296,6 +296,7 @@ def generate_pretrain(
     seed: int = 0,
     workers: int = 8,
     emoji_subset: list[str] | None = None,
+    task: str = "pretrain",
 ) -> Path:
     """Render the SSL pretrain dataset.
 
@@ -339,6 +340,10 @@ def generate_pretrain(
     # Build the payload list: one entry per scene we want to render.
     # Every scene gets a unique index so the worker can name files
     # deterministically and so the per-scene seed is stable.
+    if task not in task_specs():
+        raise KeyError(
+            f"unknown task {task!r}; choose from {list(task_specs())}")
+
     payloads = []
     idx = 0
     for anchor_hex in anchors:
@@ -347,7 +352,7 @@ def generate_pretrain(
                 "out_dir": str(out_dir),
                 "filename": f"{idx:07d}.jpg",
                 "seed": _seed_for(seed, idx),
-                "task": "pretrain",
+                "task": task,
                 "anchor_hex": anchor_hex,
             })
             idx += 1
@@ -616,7 +621,9 @@ def generate_all_probes(
     out_root = Path(out_root)
     out_root.mkdir(parents=True, exist_ok=True)
 
-    exclude = set(exclude_tasks or ["leaf"])
+    # Default-skip ``leaf`` (redundant with ``base_leaf``) and the
+    # ``*_clean`` variants — those are opt-in via ``generate_clean.py``.
+    exclude = set(exclude_tasks or ["leaf", "group_clean", "subgroup_clean"])
     tasks = [t for t in task_specs() if t in LABEL_FUNCTIONS and t not in exclude]
 
     if per_anchor > 0 and n is None:
