@@ -3,3 +3,5 @@
 
 For 3:
 Is semantic structure from co occurence (similar objects appearing)?
+
+The first goal we need is to make sure it works on simple tasks and view what it's doing. We should add task composition too sometime.
